@@ -1,0 +1,1821 @@
+--[[
+	Yakın Oyuncuya Bak PRO v2 - LocalScript
+	Konum: StarterPlayer > StarterPlayerScripts
+
+	DÜZELTME:
+	- Daire kilidi artık serbest bakışı bozmuyor. Daire açıkken fare ekran ortasında
+	  kilitlenir (FPS gibi), kamerayı normal çevirirsin. Dairede biri görünce ona döner,
+	  daireden çıkınca bırakır, girene kadar bakmaz.
+	  (Alt basılı tut = fareyi geçici serbest bırak, menüyü kullanmak için)
+
+	YENİ:
+	- Tamamen yenilenen arayüz (kartlar, kayan sekme çizgisi, durum hapı, avatar, ipucu çubuğu)
+	- Hedef işareti (kilitlenen oyuncunun üstünde halka + isim)
+	- Daire: kalınlık, dolgu, artı işaretleri, kilitlenince yeşil + vurgu efekti
+	- "Merkez" önceliği (dairenin merkezine en yakın oyuncu)
+	- Fare tekerleği ile kamera yakınlaştırma
+	- Mini HUD (menü gizliyken durum + hedef)
+	- Menü açılış animasyonu, yeni hazır ayarlar (Daire Soft / Hızlı / Dar)
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+------------------------------------------------------------
+-- VARSAYILAN AYARLAR
+------------------------------------------------------------
+local DEFAULTS = {
+	mode = "Kamera",           -- "Karakter" / "Kamera"
+	speed = 15,
+	smoothing = "Üstel",
+	cameraYawOnly = false,
+	pitchLimit = 80,
+	cameraDistance = 12,
+	sensitivity = 1,
+	lockMouse = false,
+	wheelZoom = true,
+	changeFOV = false,
+	fov = 70,
+	aimPart = "Gövde",
+	heightOffset = 0,
+	priority = "Mesafe",       -- "Mesafe" / "Can" / "Nişangâh" / "Merkez"
+	maxDistance = 150,
+	minDistance = 0,
+	fovLimit = 180,
+	ignoreTeam = false,
+	ignoreFriends = false,
+	wallCheck = false,
+	sticky = false,
+	-- daire
+	circleEnabled = false,
+	circleRadius = 120,
+	circleThickness = 2,
+	circleFill = true,
+	circleMouseLock = true,    -- daire açıkken fare ortada kilitli (serbest bakış)
+	showMarker = true,
+	-- tuşlar
+	keyToggle = Enum.KeyCode.X,
+	keyMenu = Enum.KeyCode.RightControl,
+	keyCircle = Enum.KeyCode.C,
+	holdMode = false,
+	-- arayüz
+	mobileUI = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled,
+	uiScale = 1,
+	uiOpacity = 0,
+	accent = Color3.fromRGB(88, 130, 255),
+	hud = true,
+	silentUI = false,
+	notifications = true,
+}
+
+local settings = {}
+for k, v in pairs(DEFAULTS) do
+	settings[k] = v
+end
+
+local THEME = {
+	bg = Color3.fromRGB(16, 17, 24),
+	header = Color3.fromRGB(24, 26, 36),
+	card = Color3.fromRGB(28, 30, 42),
+	track = Color3.fromRGB(46, 49, 66),
+	stroke = Color3.fromRGB(46, 49, 68),
+	text = Color3.fromRGB(236, 238, 246),
+	subtext = Color3.fromRGB(140, 146, 170),
+	accent = settings.accent,
+	green = Color3.fromRGB(46, 190, 110),
+	red = Color3.fromRGB(230, 72, 82),
+	off = Color3.fromRGB(58, 61, 80),
+}
+
+local WHITE = Color3.new(1, 1, 1)
+
+local controls = {}
+local rerenders = {}
+local listener = nil
+
+-- ileri bildirimler
+local setRunning, applyMobile, notify, refreshDot, updateHints, setMenuVisible
+local running = false
+local hiddenBySilent = false
+local minimized = false
+local targetScale = settings.uiScale
+
+------------------------------------------------------------
+-- YARDIMCILAR
+------------------------------------------------------------
+local function create(class, props, parent)
+	local obj = Instance.new(class)
+	for k, v in pairs(props) do
+		obj[k] = v
+	end
+	obj.Parent = parent
+	return obj
+end
+
+local function corner(parent, radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+end
+
+local function stroke(parent, color, thickness)
+	return create("UIStroke", { Color = color, Thickness = thickness or 1 }, parent)
+end
+
+local function gradient(parent, c0, c1, rot)
+	return create("UIGradient", { Color = ColorSequence.new(c0, c1), Rotation = rot or 90 }, parent)
+end
+
+local function tween(obj, props, t, style, dir)
+	TweenService:Create(obj, TweenInfo.new(t or 0.15, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props):Play()
+end
+
+local orders = setmetatable({}, { __mode = "k" })
+local function nextOrder(page)
+	orders[page] = (orders[page] or 0) + 1
+	return orders[page]
+end
+
+local function applyValues(values)
+	for k, v in pairs(values) do
+		if controls[k] then
+			controls[k].set(v)
+		end
+	end
+end
+
+-- Aynı ayarı birden fazla yerde göstermek için
+local function register(key, renderFn, hook)
+	local c = controls[key]
+	if not c then
+		c = { renders = {}, hooks = {} }
+		c.set = function(v)
+			settings[key] = v
+			for _, r in ipairs(c.renders) do r() end
+			for _, h in ipairs(c.hooks) do h(v) end
+		end
+		controls[key] = c
+	end
+	table.insert(c.renders, renderFn)
+	if hook then table.insert(c.hooks, hook) end
+	table.insert(rerenders, renderFn)
+end
+
+------------------------------------------------------------
+-- HAZIR AYARLAR
+------------------------------------------------------------
+local PRESETS = {
+	{ name = "Yumuşak", values = { speed = 4, smoothing = "Üstel", cameraDistance = 14, changeFOV = false, cameraYawOnly = false } },
+	{ name = "Dengeli", values = { speed = 12, smoothing = "Üstel", cameraDistance = 12, changeFOV = false, cameraYawOnly = false } },
+	{ name = "Hızlı", values = { speed = 30, smoothing = "Üstel", cameraDistance = 10, changeFOV = false, cameraYawOnly = false } },
+	{ name = "Anında", values = { speed = 50, smoothing = "Üstel", cameraDistance = 12, changeFOV = false, cameraYawOnly = false } },
+	{ name = "Sinematik", values = { speed = 3, smoothing = "Üstel", cameraDistance = 20, changeFOV = true, fov = 60, cameraYawOnly = true } },
+	{ name = "1. Şahıs", values = { speed = 25, smoothing = "Üstel", cameraDistance = 0, changeFOV = true, fov = 85, cameraYawOnly = false } },
+	{ name = "Daire Soft", values = { speed = 6, smoothing = "Üstel", circleEnabled = true, circleRadius = 140, priority = "Merkez", sticky = false } },
+	{ name = "Daire Hızlı", values = { speed = 24, smoothing = "Üstel", circleEnabled = true, circleRadius = 110, priority = "Merkez", sticky = false } },
+	{ name = "Daire Dar", values = { speed = 14, smoothing = "Üstel", circleEnabled = true, circleRadius = 60, priority = "Merkez", sticky = false } },
+}
+
+local SNAP_KEYS = {
+	"mode", "speed", "smoothing", "cameraYawOnly", "pitchLimit", "cameraDistance", "sensitivity",
+	"lockMouse", "wheelZoom", "changeFOV", "fov", "aimPart", "heightOffset", "priority", "maxDistance",
+	"minDistance", "fovLimit", "ignoreTeam", "ignoreFriends", "wallCheck", "sticky",
+	"circleEnabled", "circleRadius", "circleThickness", "circleFill", "circleMouseLock", "showMarker",
+}
+local slots = {}
+
+------------------------------------------------------------
+-- ANA ARAYÜZ
+------------------------------------------------------------
+local oldGui = player:WaitForChild("PlayerGui"):FindFirstChild("YakinOyuncuyaBakGui")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local gui = create("ScreenGui", {
+	Name = "YakinOyuncuyaBakGui",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player.PlayerGui)
+
+------------------------------------------------------------
+-- DAİRE + HEDEF İŞARETİ (menünün altında kalsın diye önce oluşturulur)
+------------------------------------------------------------
+local circle = create("Frame", {
+	Name = "Daire",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(settings.circleRadius * 2, settings.circleRadius * 2),
+	BackgroundColor3 = THEME.accent,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	Visible = false,
+	Active = false,
+}, gui)
+corner(circle, 9999)
+local circleStroke = stroke(circle, THEME.accent, 2)
+local circleDot = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(4, 4),
+	BackgroundColor3 = THEME.accent,
+	BorderSizePixel = 0,
+}, circle)
+corner(circleDot, 2)
+
+local ticks = {}
+local tickDefs = {
+	{ UDim2.new(0.5, 0, 0, 0), UDim2.fromOffset(2, 10) },
+	{ UDim2.new(0.5, 0, 1, 0), UDim2.fromOffset(2, 10) },
+	{ UDim2.new(0, 0, 0.5, 0), UDim2.fromOffset(10, 2) },
+	{ UDim2.new(1, 0, 0.5, 0), UDim2.fromOffset(10, 2) },
+}
+for _, d in ipairs(tickDefs) do
+	table.insert(ticks, create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = d[1],
+		Size = d[2],
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+	}, circle))
+end
+
+local circleLocked = false
+local function renderCircle()
+	circle.Visible = settings.circleEnabled
+	local r = settings.circleRadius
+	circle.Size = UDim2.fromOffset(r * 2, r * 2)
+	local locked = circleLocked and running
+	local col = locked and THEME.green or THEME.accent
+	circleStroke.Color = col
+	circleStroke.Thickness = settings.circleThickness
+	circleStroke.Transparency = running and 0.05 or 0.5
+	circleDot.BackgroundColor3 = col
+	circle.BackgroundColor3 = col
+	circle.BackgroundTransparency = settings.circleFill and (locked and 0.86 or 0.94) or 1
+	for _, t in ipairs(ticks) do
+		t.BackgroundColor3 = col
+		t.BackgroundTransparency = running and 0 or 0.5
+	end
+end
+table.insert(rerenders, renderCircle)
+
+local marker = create("Frame", {
+	Name = "HedefIsareti",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Size = UDim2.fromOffset(30, 30),
+	BackgroundTransparency = 1,
+	Visible = false,
+}, gui)
+corner(marker, 15)
+local markerStroke = stroke(marker, THEME.green, 2)
+local markerLabel = create("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 1, 4),
+	Size = UDim2.fromOffset(140, 14),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = WHITE,
+	TextStrokeTransparency = 0.4,
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+}, marker)
+
+------------------------------------------------------------
+-- ANA PENCERE
+------------------------------------------------------------
+local WIN_W, WIN_H = 380, 540
+local HEADER_H, TAB_H, FOOT_H = 52, 36, 24
+local winH = WIN_H
+
+local main = create("Frame", {
+	Name = "Main",
+	Size = UDim2.fromOffset(WIN_W, WIN_H),
+	Position = UDim2.new(0, 30, 0.5, -WIN_H / 2),
+	BackgroundColor3 = THEME.bg,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+}, gui)
+corner(main, 16)
+gradient(main, WHITE, Color3.fromRGB(196, 196, 210), 90)
+local mainStroke = stroke(main, THEME.accent, 1.5)
+mainStroke.Transparency = 0.5
+table.insert(rerenders, function()
+	mainStroke.Color = THEME.accent
+end)
+local uiScaleObj = create("UIScale", { Scale = settings.uiScale }, main)
+
+-- Başlık
+local header = create("Frame", {
+	Size = UDim2.new(1, 0, 0, HEADER_H),
+	BackgroundColor3 = THEME.header,
+	BorderSizePixel = 0,
+}, main)
+gradient(header, WHITE, Color3.fromRGB(185, 185, 205), 0)
+
+local glow = create("Frame", {
+	Size = UDim2.new(1, 0, 0, 2),
+	Position = UDim2.new(0, 0, 1, -2),
+	BackgroundColor3 = THEME.accent,
+	BorderSizePixel = 0,
+}, header)
+create("UIGradient", {
+	Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(1, 0.92),
+	}),
+}, glow)
+table.insert(rerenders, function()
+	glow.BackgroundColor3 = THEME.accent
+end)
+
+-- logo
+local logo = create("Frame", {
+	Size = UDim2.fromOffset(34, 34),
+	Position = UDim2.fromOffset(12, 9),
+	BackgroundColor3 = THEME.accent,
+	BorderSizePixel = 0,
+}, header)
+corner(logo, 10)
+gradient(logo, WHITE, Color3.fromRGB(150, 150, 175), 45)
+table.insert(rerenders, function()
+	logo.BackgroundColor3 = THEME.accent
+end)
+create("TextLabel", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	Text = "◎",
+	TextColor3 = WHITE,
+	Font = Enum.Font.GothamBold,
+	TextSize = 20,
+}, logo)
+
+create("TextLabel", {
+	Size = UDim2.new(1, -170, 0, 20),
+	Position = UDim2.fromOffset(54, 8),
+	BackgroundTransparency = 1,
+	Text = "Yakın Oyuncuya Bak",
+	TextColor3 = THEME.text,
+	Font = Enum.Font.GothamBold,
+	TextSize = 15,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+create("TextLabel", {
+	Size = UDim2.new(1, -170, 0, 14),
+	Position = UDim2.fromOffset(54, 28),
+	BackgroundTransparency = 1,
+	Text = "PRO v2  •  hedef kilitleme",
+	TextColor3 = THEME.subtext,
+	Font = Enum.Font.Gotham,
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+
+-- durum hapı
+local pill = create("Frame", {
+	Size = UDim2.fromOffset(72, 22),
+	Position = UDim2.new(1, -118, 0.5, -11),
+	BackgroundColor3 = THEME.off,
+	BorderSizePixel = 0,
+}, header)
+corner(pill, 11)
+local statusDot = create("Frame", {
+	Size = UDim2.fromOffset(8, 8),
+	Position = UDim2.fromOffset(9, 7),
+	BackgroundColor3 = THEME.subtext,
+	BorderSizePixel = 0,
+}, pill)
+corner(statusDot, 4)
+local dotStroke = create("UIStroke", { Color = THEME.green, Thickness = 3, Transparency = 1 }, statusDot)
+local pulseTween = nil
+local pillText = create("TextLabel", {
+	Position = UDim2.fromOffset(22, 0),
+	Size = UDim2.new(1, -26, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "KAPALI",
+	TextColor3 = THEME.subtext,
+	Font = Enum.Font.GothamBold,
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, pill)
+
+local minimizeBtn = create("TextButton", {
+	Size = UDim2.fromOffset(28, 28),
+	Position = UDim2.new(1, -38, 0.5, -14),
+	BackgroundColor3 = THEME.off,
+	Text = "–",
+	TextColor3 = THEME.text,
+	Font = Enum.Font.GothamBold,
+	TextSize = 16,
+}, header)
+corner(minimizeBtn, 8)
+gradient(minimizeBtn, WHITE, Color3.fromRGB(190, 190, 200), 90)
+
+-- Sekme çubuğu
+local tabBar = create("Frame", {
+	Position = UDim2.fromOffset(0, HEADER_H),
+	Size = UDim2.new(1, 0, 0, TAB_H),
+	BackgroundColor3 = THEME.header,
+	BorderSizePixel = 0,
+}, main)
+
+local pageHolder = create("Frame", {
+	Position = UDim2.fromOffset(0, HEADER_H + TAB_H),
+	Size = UDim2.new(1, 0, 1, -(HEADER_H + TAB_H + FOOT_H)),
+	BackgroundTransparency = 1,
+}, main)
+
+-- Alt ipucu çubuğu
+local footer = create("Frame", {
+	AnchorPoint = Vector2.new(0, 1),
+	Position = UDim2.new(0, 0, 1, 0),
+	Size = UDim2.new(1, 0, 0, FOOT_H),
+	BackgroundColor3 = THEME.header,
+	BorderSizePixel = 0,
+}, main)
+local hintLabel = create("TextLabel", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = THEME.subtext,
+	Font = Enum.Font.Gotham,
+	TextSize = 10,
+}, footer)
+
+updateHints = function()
+	if settings.mobileUI then
+		hintLabel.Text = "Ekrana sürükle = kamera  •  sağdaki butonlar = kontrol"
+	else
+		hintLabel.Text = string.format("%s başlat  •  %s menü  •  %s daire  •  Alt = fareyi bırak",
+			settings.keyToggle.Name, settings.keyMenu.Name, settings.keyCircle.Name)
+	end
+end
+
+local TAB_NAMES = { "Ana", "Kamera", "Hedef", "Ayarlar" }
+local pages, tabButtons = {}, {}
+local currentTab = "Ana"
+
+local tabIndicator = create("Frame", {
+	Size = UDim2.new(0.6 / #TAB_NAMES, 0, 0, 3),
+	Position = UDim2.new(0.2 / #TAB_NAMES, 0, 1, -3),
+	BackgroundColor3 = THEME.accent,
+	BorderSizePixel = 0,
+}, tabBar)
+corner(tabIndicator, 2)
+
+local function renderTabs()
+	for i, name in ipairs(TAB_NAMES) do
+		local t = tabButtons[name]
+		local active = (name == currentTab)
+		t.button.TextColor3 = active and THEME.text or THEME.subtext
+		pages[name].Visible = active
+		if active then
+			tabIndicator.BackgroundColor3 = THEME.accent
+			tween(tabIndicator, { Position = UDim2.new((i - 1) / #TAB_NAMES + 0.2 / #TAB_NAMES, 0, 1, -3) }, 0.2)
+		end
+	end
+end
+table.insert(rerenders, renderTabs)
+
+for i, name in ipairs(TAB_NAMES) do
+	local btn = create("TextButton", {
+		Size = UDim2.new(1 / #TAB_NAMES, 0, 1, -3),
+		Position = UDim2.new((i - 1) / #TAB_NAMES, 0, 0, 0),
+		BackgroundTransparency = 1,
+		Text = name,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = THEME.subtext,
+	}, tabBar)
+	tabButtons[name] = { button = btn }
+
+	local page = create("ScrollingFrame", {
+		Name = name,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = THEME.track,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		Visible = false,
+	}, pageHolder)
+	create("UIListLayout", { Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 14),
+		PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+	}, page)
+	pages[name] = page
+
+	btn.MouseButton1Click:Connect(function()
+		currentTab = name
+		renderTabs()
+	end)
+end
+
+------------------------------------------------------------
+-- MİNİ HUD + BİLDİRİM
+------------------------------------------------------------
+local hud = create("Frame", {
+	Name = "HUD",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 14),
+	Size = UDim2.fromOffset(200, 28),
+	BackgroundColor3 = THEME.header,
+	BackgroundTransparency = 0.15,
+	BorderSizePixel = 0,
+	Visible = false,
+}, gui)
+corner(hud, 14)
+local hudStroke = stroke(hud, THEME.green, 1.5)
+hudStroke.Transparency = 0.4
+local hudDot = create("Frame", {
+	Size = UDim2.fromOffset(10, 10),
+	Position = UDim2.fromOffset(9, 9),
+	BackgroundColor3 = THEME.green,
+	BorderSizePixel = 0,
+}, hud)
+corner(hudDot, 5)
+local hudText = create("TextLabel", {
+	Position = UDim2.fromOffset(26, 0),
+	Size = UDim2.new(1, -34, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "Hedef yok",
+	TextColor3 = THEME.text,
+	Font = Enum.Font.GothamMedium,
+	TextSize = 12,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+}, hud)
+
+refreshDot = function()
+	local show = running and not main.Visible and (settings.hud or settings.silentUI)
+	hud.Visible = show and true or false
+	local compact = settings.silentUI
+	hudText.Visible = not compact
+	hud.Size = compact and UDim2.fromOffset(28, 28) or UDim2.fromOffset(200, 28)
+	hud.Position = compact and UDim2.new(1, -30, 0, 46) or UDim2.new(0.5, 0, 0, 14)
+	hud.AnchorPoint = compact and Vector2.new(0, 0) or Vector2.new(0.5, 0)
+end
+
+local toastFrame = create("Frame", {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -80),
+	Size = UDim2.fromOffset(220, 36),
+	BackgroundColor3 = THEME.header,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+}, gui)
+corner(toastFrame, 10)
+local toastBar = create("Frame", {
+	Size = UDim2.new(0, 4, 1, -12),
+	Position = UDim2.fromOffset(8, 6),
+	BackgroundColor3 = THEME.accent,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+}, toastFrame)
+corner(toastBar, 2)
+local toastLabel = create("TextLabel", {
+	Position = UDim2.fromOffset(18, 0),
+	Size = UDim2.new(1, -24, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = THEME.text,
+	TextTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+}, toastFrame)
+
+local toastToken = 0
+notify = function(text)
+	if not settings.notifications or settings.silentUI then return end
+	toastToken += 1
+	local my = toastToken
+	toastLabel.Text = text
+	toastBar.BackgroundColor3 = THEME.accent
+	tween(toastFrame, { BackgroundTransparency = 0.05 }, 0.15)
+	tween(toastBar, { BackgroundTransparency = 0 }, 0.15)
+	tween(toastLabel, { TextTransparency = 0 }, 0.15)
+	task.delay(1.6, function()
+		if my == toastToken then
+			tween(toastFrame, { BackgroundTransparency = 1 }, 0.3)
+			tween(toastBar, { BackgroundTransparency = 1 }, 0.3)
+			tween(toastLabel, { TextTransparency = 1 }, 0.3)
+		end
+	end)
+end
+
+setMenuVisible = function(v)
+	if v == main.Visible then return end
+	main.Visible = v
+	if v then
+		uiScaleObj.Scale = targetScale * 0.92
+		tween(uiScaleObj, { Scale = targetScale }, 0.22, Enum.EasingStyle.Back)
+	end
+	refreshDot()
+end
+
+------------------------------------------------------------
+-- BİLEŞENLER
+------------------------------------------------------------
+-- Kart: ayarları gruplar. İçine bileşenler "page" gibi eklenir.
+local function card(page, title)
+	local c = create("Frame", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = THEME.card,
+		BorderSizePixel = 0,
+	}, page)
+	corner(c, 12)
+	gradient(c, WHITE, Color3.fromRGB(210, 210, 222), 90)
+	stroke(c, THEME.stroke, 1)
+	create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, c)
+	create("UIPadding", {
+		PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 12),
+		PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+	}, c)
+	if title then
+		local row = create("Frame", {
+			LayoutOrder = nextOrder(c),
+			Size = UDim2.new(1, 0, 0, 16),
+			BackgroundTransparency = 1,
+		}, c)
+		local bar = create("Frame", {
+			Size = UDim2.fromOffset(3, 12),
+			Position = UDim2.fromOffset(0, 2),
+			BackgroundColor3 = THEME.accent,
+			BorderSizePixel = 0,
+		}, row)
+		corner(bar, 2)
+		table.insert(rerenders, function()
+			bar.BackgroundColor3 = THEME.accent
+		end)
+		create("TextLabel", {
+			Position = UDim2.fromOffset(10, 0),
+			Size = UDim2.new(1, -10, 1, 0),
+			BackgroundTransparency = 1,
+			Text = title,
+			TextColor3 = THEME.subtext,
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+	end
+	return c
+end
+
+local function makeButton(parent, text, color, callback, size, order)
+	local btn = create("TextButton", {
+		LayoutOrder = order or 0,
+		Size = size or UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = color,
+		Text = text,
+		TextColor3 = WHITE,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		AutoButtonColor = true,
+	}, parent)
+	corner(btn, 9)
+	gradient(btn, WHITE, Color3.fromRGB(185, 185, 200), 90)
+	local st = stroke(btn, WHITE, 1)
+	st.Transparency = 0.88
+	btn.MouseButton1Click:Connect(callback)
+	return btn
+end
+
+local function makeGrid(page, cols)
+	local grid = create("Frame", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+	}, page)
+	create("UIGridLayout", {
+		CellSize = UDim2.new(1 / cols, -6, 0, 30),
+		CellPadding = UDim2.fromOffset(6, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, grid)
+	return grid
+end
+
+local function makeNote(page, text)
+	create("TextLabel", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Text = text,
+		TextColor3 = THEME.subtext,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, page)
+end
+
+local function makeSlider(page, name, key, min, max, decimals, suffix, onChange)
+	local scroller = page:IsA("ScrollingFrame") and page or page:FindFirstAncestorOfClass("ScrollingFrame")
+	local holder = create("Frame", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundTransparency = 1,
+	}, page)
+	create("TextLabel", {
+		Size = UDim2.new(1, -80, 0, 18),
+		BackgroundTransparency = 1,
+		Text = name,
+		TextColor3 = THEME.text,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, holder)
+	local valueLabel = create("TextLabel", {
+		Position = UDim2.new(1, -80, 0, 0),
+		Size = UDim2.fromOffset(80, 18),
+		BackgroundTransparency = 1,
+		TextColor3 = THEME.accent,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	}, holder)
+	local track = create("Frame", {
+		Position = UDim2.fromOffset(0, 30),
+		Size = UDim2.new(1, 0, 0, 6),
+		BackgroundColor3 = THEME.track,
+		BorderSizePixel = 0,
+	}, holder)
+	corner(track, 3)
+	local fill = create("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = THEME.accent, BorderSizePixel = 0 }, track)
+	corner(fill, 3)
+	gradient(fill, WHITE, Color3.fromRGB(190, 190, 205), 0)
+	local knob = create("Frame", {
+		Size = UDim2.fromOffset(16, 16),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+	}, track)
+	corner(knob, 8)
+	local knobStroke = stroke(knob, THEME.accent, 2)
+
+	local mult = 10 ^ decimals
+	local function render()
+		local v = settings[key]
+		local a = (v - min) / (max - min)
+		fill.Size = UDim2.new(a, 0, 1, 0)
+		knob.Position = UDim2.new(a, 0, 0.5, 0)
+		valueLabel.Text = tostring(v) .. suffix
+		valueLabel.TextColor3 = THEME.accent
+		fill.BackgroundColor3 = THEME.accent
+		knobStroke.Color = THEME.accent
+	end
+	local function set(v)
+		v = math.clamp(math.floor(v * mult + 0.5) / mult, min, max)
+		settings[key] = v
+		render()
+		if onChange then onChange(v) end
+	end
+	controls[key] = { set = set }
+	table.insert(rerenders, render)
+
+	local dragging = false
+	local function fromX(x)
+		local a = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		set(min + (max - min) * a)
+	end
+	holder.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			if scroller then scroller.ScrollingEnabled = false end
+			fromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			fromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+			if scroller then scroller.ScrollingEnabled = true end
+		end
+	end)
+	set(settings[key])
+end
+
+local function makeToggle(page, name, key, onChange)
+	local holder = create("TextButton", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+	}, page)
+	create("TextLabel", {
+		Size = UDim2.new(1, -52, 1, 0),
+		BackgroundTransparency = 1,
+		Text = name,
+		TextColor3 = THEME.text,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, holder)
+	local pillF = create("Frame", {
+		Size = UDim2.fromOffset(40, 20),
+		Position = UDim2.new(1, -40, 0.5, -10),
+		BackgroundColor3 = THEME.off,
+		BorderSizePixel = 0,
+	}, holder)
+	corner(pillF, 10)
+	local dot = create("Frame", {
+		Size = UDim2.fromOffset(16, 16),
+		Position = UDim2.fromOffset(2, 2),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+	}, pillF)
+	corner(dot, 8)
+
+	local function render()
+		local s = settings[key]
+		tween(pillF, { BackgroundColor3 = s and THEME.accent or THEME.off })
+		tween(dot, { Position = s and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2) }, 0.15, Enum.EasingStyle.Back)
+	end
+	register(key, render, onChange)
+	holder.MouseButton1Click:Connect(function()
+		controls[key].set(not settings[key])
+	end)
+	render()
+end
+
+local function makeSegmented(page, name, key, options, onChange)
+	local holder = create("Frame", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 56),
+		BackgroundTransparency = 1,
+	}, page)
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 18),
+		BackgroundTransparency = 1,
+		Text = name,
+		TextColor3 = THEME.text,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, holder)
+	local box = create("Frame", {
+		Position = UDim2.fromOffset(0, 22),
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = THEME.bg,
+		BorderSizePixel = 0,
+	}, holder)
+	corner(box, 9)
+	stroke(box, THEME.stroke, 1)
+	local buttons = {}
+	local n = #options
+	for i, opt in ipairs(options) do
+		local btn = create("TextButton", {
+			Size = UDim2.new(1 / n, -4, 1, -6),
+			Position = UDim2.new((i - 1) / n, 2, 0, 3),
+			BackgroundColor3 = THEME.accent,
+			BackgroundTransparency = 1,
+			Text = opt,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = THEME.subtext,
+			AutoButtonColor = false,
+		}, box)
+		corner(btn, 7)
+		buttons[opt] = btn
+		btn.MouseButton1Click:Connect(function()
+			controls[key].set(opt)
+		end)
+	end
+	local function render()
+		for opt, btn in pairs(buttons) do
+			local active = settings[key] == opt
+			btn.BackgroundColor3 = THEME.accent
+			tween(btn, { BackgroundTransparency = active and 0 or 1 })
+			btn.TextColor3 = active and WHITE or THEME.subtext
+		end
+	end
+	controls[key] = {
+		set = function(v)
+			settings[key] = v
+			render()
+			if onChange then onChange(v) end
+		end,
+	}
+	table.insert(rerenders, render)
+	render()
+end
+
+local function makeKeybind(page, name, key)
+	local holder = create("Frame", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+	}, page)
+	create("TextLabel", {
+		Size = UDim2.new(1, -120, 1, 0),
+		BackgroundTransparency = 1,
+		Text = name,
+		TextColor3 = THEME.text,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, holder)
+	local btn = create("TextButton", {
+		Size = UDim2.fromOffset(112, 28),
+		Position = UDim2.new(1, -112, 0.5, -14),
+		BackgroundColor3 = THEME.off,
+		TextColor3 = THEME.text,
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		AutoButtonColor = true,
+	}, holder)
+	corner(btn, 8)
+	gradient(btn, WHITE, Color3.fromRGB(195, 195, 208), 90)
+	stroke(btn, THEME.stroke, 1)
+	local function render()
+		btn.Text = settings[key].Name
+		btn.BackgroundColor3 = THEME.off
+		updateHints()
+	end
+	controls[key] = {
+		set = function(v)
+			settings[key] = v
+			render()
+		end,
+	}
+	btn.MouseButton1Click:Connect(function()
+		btn.Text = "Bir tuşa bas..."
+		btn.BackgroundColor3 = THEME.accent
+		listener = function(code)
+			if code ~= Enum.KeyCode.Escape then
+				settings[key] = code
+			end
+			render()
+		end
+	end)
+	render()
+end
+
+------------------------------------------------------------
+-- SEKME: ANA
+------------------------------------------------------------
+local runBtn, statusText, targetText, hpText, hpFill, avatar, avatarQ
+
+do
+	local page = pages["Ana"]
+
+	runBtn = makeButton(page, "▶  ÇALIŞTIR", THEME.green, function() end, UDim2.new(1, 0, 0, 46), nextOrder(page))
+	runBtn.TextSize = 16
+
+	-- durum kartı (avatar + hedef bilgisi)
+	local sc = create("Frame", {
+		LayoutOrder = nextOrder(page),
+		Size = UDim2.new(1, 0, 0, 94),
+		BackgroundColor3 = THEME.card,
+		BorderSizePixel = 0,
+	}, page)
+	corner(sc, 12)
+	gradient(sc, WHITE, Color3.fromRGB(205, 205, 218), 90)
+	stroke(sc, THEME.stroke, 1)
+
+	avatar = create("ImageLabel", {
+		Position = UDim2.fromOffset(12, 12),
+		Size = UDim2.fromOffset(58, 58),
+		BackgroundColor3 = THEME.track,
+		BorderSizePixel = 0,
+		Image = "",
+	}, sc)
+	corner(avatar, 29)
+	local avStroke = stroke(avatar, THEME.accent, 2)
+	table.insert(rerenders, function()
+		avStroke.Color = THEME.accent
+	end)
+	avatarQ = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "?",
+		TextColor3 = THEME.subtext,
+		Font = Enum.Font.GothamBold,
+		TextSize = 22,
+	}, avatar)
+
+	statusText = create("TextLabel", {
+		Position = UDim2.fromOffset(82, 10), Size = UDim2.new(1, -94, 0, 16),
+		BackgroundTransparency = 1, Text = "Durum: Kapalı", TextColor3 = THEME.subtext,
+		Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+	}, sc)
+	targetText = create("TextLabel", {
+		Position = UDim2.fromOffset(82, 28), Size = UDim2.new(1, -94, 0, 16),
+		BackgroundTransparency = 1, Text = "Hedef: -", TextColor3 = THEME.text,
+		Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, sc)
+	hpText = create("TextLabel", {
+		Position = UDim2.fromOffset(82, 46), Size = UDim2.new(1, -94, 0, 14),
+		BackgroundTransparency = 1, Text = "", TextColor3 = THEME.subtext,
+		Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+	}, sc)
+	local hpTrack = create("Frame", {
+		Position = UDim2.fromOffset(12, 78), Size = UDim2.new(1, -24, 0, 8),
+		BackgroundColor3 = THEME.track, BorderSizePixel = 0,
+	}, sc)
+	corner(hpTrack, 4)
+	hpFill = create("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = THEME.green, BorderSizePixel = 0 }, hpTrack)
+	corner(hpFill, 4)
+
+	local modeCard = card(page, "GENEL")
+	makeSegmented(modeCard, "Mod", "mode", { "Karakter", "Kamera" })
+	makeToggle(modeCard, "Mobil sürüm (dokunmatik arayüz)", "mobileUI", function()
+		if applyMobile then applyMobile() end
+	end)
+
+	local circleCard = card(page, "DAİRE KİLİDİ")
+	makeToggle(circleCard, "Daire kilidini aç", "circleEnabled", function()
+		renderCircle()
+	end)
+	makeNote(circleCard, "Daire açıkken kamerayı normal çevirirsin. Dairenin içine giren oyuncuya otomatik döner, çıkınca bırakır. Ayrıntılar: Hedef sekmesi.")
+
+	local presetCard = card(page, "HAZIR AYARLAR")
+	local grid = makeGrid(presetCard, 3)
+	for i, p in ipairs(PRESETS) do
+		local b = makeButton(grid, p.name, THEME.off, function()
+			applyValues(p.values)
+			notify("Ayar: " .. p.name)
+		end, nil, i)
+		b.TextSize = 12
+	end
+end
+
+------------------------------------------------------------
+-- SEKME: KAMERA
+------------------------------------------------------------
+do
+	local page = pages["Kamera"]
+	local c1 = card(page, "DÖNÜŞ")
+	makeSlider(c1, "Dönme hızı (50 = anında)", "speed", 1, 50, 0, "")
+	makeSegmented(c1, "Yumuşatma tipi", "smoothing", { "Üstel", "Lineer" })
+	makeToggle(c1, "Sadece yatay dön", "cameraYawOnly")
+	makeSlider(c1, "Yukarı/aşağı sınırı", "pitchLimit", 10, 89, 0, "°")
+
+	local c2 = card(page, "KAMERA")
+	makeSlider(c2, "Kamera uzaklığı (0 = 1. şahıs)", "cameraDistance", 0, 40, 0, " st")
+	makeSlider(c2, "Mouse / dokunma hassasiyeti", "sensitivity", 0.2, 3, 1, "x")
+	makeToggle(c2, "Fare tekerleği ile yakınlaştır", "wheelZoom")
+	makeToggle(c2, "Mouse hep kamerayı çevirsin", "lockMouse")
+	makeToggle(c2, "Görüş açısını (FOV) değiştir", "changeFOV")
+	makeSlider(c2, "FOV", "fov", 40, 110, 0, "°")
+
+	local c3 = card(page, "NİŞAN NOKTASI")
+	makeSegmented(c3, "Bakılacak bölge", "aimPart", { "Kafa", "Gövde", "Kök" })
+	makeSlider(c3, "Yükseklik kaydırma", "heightOffset", -3, 3, 1, " st")
+end
+
+------------------------------------------------------------
+-- SEKME: HEDEF
+------------------------------------------------------------
+do
+	local page = pages["Hedef"]
+	local c1 = card(page, "DAİRE KİLİDİ")
+	makeToggle(c1, "Daire kilidini aç", "circleEnabled", function()
+		renderCircle()
+	end)
+	makeSlider(c1, "Daire yarıçapı", "circleRadius", 20, 500, 0, " px", function()
+		renderCircle()
+	end)
+	makeSlider(c1, "Çizgi kalınlığı", "circleThickness", 1, 6, 0, " px", function()
+		renderCircle()
+	end)
+	makeToggle(c1, "Daire içini boya", "circleFill", function()
+		renderCircle()
+	end)
+	makeToggle(c1, "Fareyi ortada kilitle (serbest bakış)", "circleMouseLock")
+	makeToggle(c1, "Hedef işaretini göster", "showMarker")
+	makeNote(c1, "İpucu: Menüyü kullanmak için Alt'a basılı tut, fare geçici olarak serbest kalır.")
+
+	local c2 = card(page, "HEDEF SEÇİMİ")
+	makeSegmented(c2, "Öncelik", "priority", { "Mesafe", "Can", "Nişangâh", "Merkez" })
+	makeSlider(c2, "Maksimum mesafe", "maxDistance", 10, 1000, 0, " st")
+	makeSlider(c2, "Minimum mesafe", "minDistance", 0, 200, 0, " st")
+	makeSlider(c2, "Görüş açısı sınırı (180 = sınırsız)", "fovLimit", 10, 180, 0, "°")
+
+	local c3 = card(page, "FİLTRELER")
+	makeToggle(c3, "Takım arkadaşlarını yoksay", "ignoreTeam")
+	makeToggle(c3, "Arkadaşlarımı yoksay", "ignoreFriends")
+	makeToggle(c3, "Duvar arkasındakileri yoksay", "wallCheck")
+	makeToggle(c3, "Hedefe yapış (geçerli olduğu sürece)", "sticky")
+end
+
+------------------------------------------------------------
+-- SEKME: AYARLAR
+------------------------------------------------------------
+do
+	local page = pages["Ayarlar"]
+
+	local c1 = card(page, "KISAYOLLAR")
+	makeKeybind(c1, "Başlat / Durdur tuşu", "keyToggle")
+	makeKeybind(c1, "Menüyü gizle / göster tuşu", "keyMenu")
+	makeKeybind(c1, "Daire aç / kapat tuşu", "keyCircle")
+	makeToggle(c1, "Basılı tut modu (bırakınca durur)", "holdMode")
+
+	local c2 = card(page, "KAYIT SLOTLARI (oyun kapanana kadar)")
+	for i = 1, 3 do
+		local row = create("Frame", {
+			LayoutOrder = nextOrder(c2),
+			Size = UDim2.new(1, 0, 0, 32),
+			BackgroundTransparency = 1,
+		}, c2)
+		local lbl = create("TextLabel", {
+			Size = UDim2.new(1, -140, 1, 0), BackgroundTransparency = 1,
+			Text = "Slot " .. i .. "  (boş)", TextColor3 = THEME.text,
+			Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+		makeButton(row, "Kaydet", THEME.off, function()
+			local snap = {}
+			for _, k in ipairs(SNAP_KEYS) do
+				snap[k] = settings[k]
+			end
+			slots[i] = snap
+			lbl.Text = "Slot " .. i .. "  (dolu)"
+			notify("Slot " .. i .. " kaydedildi")
+		end, UDim2.fromOffset(66, 28), 1).Position = UDim2.new(1, -136, 0.5, -14)
+		makeButton(row, "Yükle", THEME.accent, function()
+			if slots[i] then
+				applyValues(slots[i])
+				notify("Slot " .. i .. " yüklendi")
+			end
+		end, UDim2.fromOffset(64, 28), 2).Position = UDim2.new(1, -64, 0.5, -14)
+	end
+
+	local c3 = card(page, "ARAYÜZ")
+	makeToggle(c3, "Mobil sürüm (dokunmatik arayüz)", "mobileUI")
+	makeSlider(c3, "Arayüz boyutu", "uiScale", 0.7, 1.3, 2, "x", function()
+		if applyMobile then applyMobile() end
+	end)
+	makeSlider(c3, "Saydamlık", "uiOpacity", 0, 0.6, 2, "", function(v)
+		main.BackgroundTransparency = v
+	end)
+
+	local colorRow = create("Frame", {
+		LayoutOrder = nextOrder(c3),
+		Size = UDim2.new(1, 0, 0, 52),
+		BackgroundTransparency = 1,
+	}, c3)
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = "Tema rengi",
+		TextColor3 = THEME.text, Font = Enum.Font.GothamMedium, TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, colorRow)
+	local swatchRow = create("Frame", {
+		Position = UDim2.fromOffset(0, 24), Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+	}, colorRow)
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, swatchRow)
+	local COLORS = {
+		Color3.fromRGB(88, 130, 255), Color3.fromRGB(150, 100, 255), Color3.fromRGB(46, 190, 110),
+		Color3.fromRGB(235, 90, 100), Color3.fromRGB(245, 160, 60), Color3.fromRGB(240, 100, 190),
+		Color3.fromRGB(60, 200, 220),
+	}
+	local swatches = {}
+	local function renderSwatches()
+		for color, s in pairs(swatches) do
+			s.stroke.Enabled = (settings.accent == color)
+		end
+	end
+	controls.accent = {
+		set = function(c)
+			settings.accent = c
+			THEME.accent = c
+			for _, f in ipairs(rerenders) do
+				f()
+			end
+			renderSwatches()
+		end,
+	}
+	for i, c in ipairs(COLORS) do
+		local b = create("TextButton", {
+			LayoutOrder = i, Size = UDim2.fromOffset(26, 26), BackgroundColor3 = c, Text = "",
+			AutoButtonColor = true,
+		}, swatchRow)
+		corner(b, 13)
+		local st = create("UIStroke", { Color = WHITE, Thickness = 2, Enabled = false }, b)
+		swatches[c] = { stroke = st }
+		b.MouseButton1Click:Connect(function()
+			controls.accent.set(c)
+		end)
+	end
+	renderSwatches()
+
+	local c4 = card(page, "HUD VE SESSİZ MOD")
+	makeToggle(c4, "Mini HUD (menü gizliyken durum)", "hud", function()
+		refreshDot()
+	end)
+	makeToggle(c4, "Çalışırken menüyü gizle (küçük nokta kalır)", "silentUI", function()
+		refreshDot()
+	end)
+	makeToggle(c4, "Bildirimleri göster", "notifications")
+
+	local c5 = card(page, "DİĞER")
+	makeButton(c5, "Tüm ayarları sıfırla", THEME.red, function()
+		applyValues(DEFAULTS)
+		notify("Ayarlar sıfırlandı")
+	end, nil, nextOrder(c5))
+end
+
+------------------------------------------------------------
+-- MOBİL SÜRÜM: yüzen butonlar + boyut/konum ayarı
+------------------------------------------------------------
+local mobileBar = create("Frame", {
+	Name = "MobilButonlar",
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -14, 0.6, 0),
+	Size = UDim2.fromOffset(60, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Visible = false,
+}, gui)
+create("UIListLayout", {
+	Padding = UDim.new(0, 10),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+}, mobileBar)
+
+local function roundButton(text, color, order, callback)
+	local b = create("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(60, 60),
+		BackgroundColor3 = color,
+		Text = text,
+		TextColor3 = WHITE,
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		AutoButtonColor = true,
+	}, mobileBar)
+	corner(b, 30)
+	gradient(b, WHITE, Color3.fromRGB(185, 185, 200), 90)
+	local st = stroke(b, WHITE, 1.5)
+	st.Transparency = 0.7
+	b.MouseButton1Click:Connect(callback)
+	return b
+end
+
+roundButton("MENÜ", THEME.header, 1, function()
+	setMenuVisible(not main.Visible)
+	hiddenBySilent = false
+end)
+
+local mobileRunBtn = roundButton("BAŞLAT", THEME.green, 2, function()
+	setRunning(not running)
+end)
+
+local mobileCircleBtn = roundButton("DAİRE", THEME.off, 3, function()
+	controls.circleEnabled.set(not settings.circleEnabled)
+	notify(settings.circleEnabled and "Daire: Açık" or "Daire: Kapalı")
+end)
+register("circleEnabled", function()
+	tween(mobileCircleBtn, { BackgroundColor3 = settings.circleEnabled and THEME.accent or THEME.off })
+end)
+
+local lastMobile = nil
+applyMobile = function()
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	local mobile = settings.mobileUI
+	local sc = settings.uiScale
+	if mobile then
+		sc = math.min(sc * 1.15, (vp.X - 20) / WIN_W)
+	end
+	targetScale = sc
+	uiScaleObj.Scale = sc
+	winH = math.min(WIN_H, math.max(HEADER_H + 120, (vp.Y - 20) / sc))
+	main.Size = UDim2.fromOffset(WIN_W, minimized and HEADER_H or winH)
+	mobileBar.Visible = mobile
+
+	if lastMobile ~= mobile then
+		lastMobile = mobile
+		if mobile then
+			main.Position = UDim2.fromOffset(10, 10)
+		else
+			main.Position = UDim2.new(0, 30, 0.5, -winH / 2)
+		end
+	end
+	updateHints()
+end
+
+-- Sürükleme / küçültme
+do
+	local dragging, dragStart, startPos
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = (input.Position - dragStart) / math.max(uiScaleObj.Scale, 0.01)
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	minimizeBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		minimizeBtn.Text = minimized and "+" or "–"
+		tween(main, { Size = UDim2.fromOffset(WIN_W, minimized and HEADER_H or winH) }, 0.2)
+	end)
+end
+
+renderTabs()
+renderCircle()
+applyMobile()
+updateHints()
+
+------------------------------------------------------------
+-- HEDEF BULMA
+------------------------------------------------------------
+local friendCache = {}
+local function isFriend(p)
+	if friendCache[p.UserId] == nil then
+		local ok, res = pcall(function()
+			return player:IsFriendsWith(p.UserId)
+		end)
+		friendCache[p.UserId] = ok and res or false
+	end
+	return friendCache[p.UserId]
+end
+
+local visParams = RaycastParams.new()
+visParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getAimPart(char)
+	local part
+	if settings.aimPart == "Kafa" then
+		part = char:FindFirstChild("Head")
+	elseif settings.aimPart == "Gövde" then
+		part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	end
+	return part or char:FindFirstChild("HumanoidRootPart")
+end
+
+local currentTarget = nil
+
+local function evaluate(other, origin, camLook, localChar)
+	if other == player then return nil end
+	local char = other.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not hrp or hum.Health <= 0 then return nil end
+	if settings.ignoreTeam and other.Team ~= nil and other.Team == player.Team then return nil end
+	if settings.ignoreFriends and isFriend(other) then return nil end
+
+	local part = getAimPart(char)
+	if not part then return nil end
+	local offset = part.Position - origin
+	local dist = offset.Magnitude
+	if dist < 0.01 or dist > settings.maxDistance or dist < settings.minDistance then return nil end
+
+	local angle = math.deg(math.acos(math.clamp(camLook:Dot(offset.Unit), -1, 1)))
+	if settings.fovLimit < 180 and angle > settings.fovLimit / 2 then return nil end
+
+	-- DAİRE KİLİDİ: oyuncu ekranda dairenin İÇİNDE olmalı (dışındaysa hiç hedef olmaz)
+	local screenDist = nil
+	if settings.circleEnabled or settings.priority == "Merkez" then
+		local v = camera:WorldToViewportPoint(part.Position)
+		if v.Z <= 0 then
+			if settings.circleEnabled then return nil end
+			screenDist = math.huge
+		else
+			screenDist = (Vector2.new(v.X, v.Y) - camera.ViewportSize / 2).Magnitude
+			if settings.circleEnabled and screenDist > settings.circleRadius then
+				return nil
+			end
+		end
+	end
+
+	if settings.wallCheck then
+		visParams.FilterDescendantsInstances = { localChar }
+		local hit = workspace:Raycast(origin, offset, visParams)
+		if hit and not hit.Instance:IsDescendantOf(char) then return nil end
+	end
+
+	local score
+	if settings.priority == "Mesafe" then
+		score = dist
+	elseif settings.priority == "Can" then
+		score = hum.Health
+	elseif settings.priority == "Merkez" then
+		score = screenDist or dist
+	else
+		score = angle
+	end
+	return { score = score, part = part, dist = dist, hum = hum }
+end
+
+local function findTarget(origin, camLook, localChar)
+	if settings.sticky and currentTarget then
+		local r = evaluate(currentTarget, origin, camLook, localChar)
+		if r then return currentTarget, r end
+	end
+	local best, bestInfo
+	for _, other in ipairs(Players:GetPlayers()) do
+		local r = evaluate(other, origin, camLook, localChar)
+		if r and (not bestInfo or r.score < bestInfo.score) then
+			best, bestInfo = other, r
+		end
+	end
+	return best, bestInfo
+end
+
+------------------------------------------------------------
+-- HEDEF BİLGİSİ (arayüz)
+------------------------------------------------------------
+local avatarCache, shownAvatar = {}, nil
+local function setAvatar(userId)
+	if shownAvatar == userId then return end
+	shownAvatar = userId
+	if not userId then
+		avatar.Image = ""
+		avatarQ.Visible = true
+		return
+	end
+	local cached = avatarCache[userId]
+	if cached then
+		avatar.Image = cached
+		avatarQ.Visible = false
+		return
+	end
+	avatar.Image = ""
+	avatarQ.Visible = true
+	task.spawn(function()
+		local ok, img = pcall(function()
+			return (Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100))
+		end)
+		if ok and img then
+			avatarCache[userId] = img
+			if shownAvatar == userId then
+				avatar.Image = img
+				avatarQ.Visible = false
+			end
+		end
+	end)
+end
+
+local function setTargetInfo(name, dist, hp, maxHp, userId)
+	if name then
+		local frac = math.clamp(hp / math.max(maxHp, 1), 0, 1)
+		targetText.Text = name
+		hpText.Text = string.format("%d st  •  HP %d / %d", math.floor(dist), math.floor(hp), math.floor(maxHp))
+		hpFill.Size = UDim2.new(frac, 0, 1, 0)
+		hpFill.BackgroundColor3 = Color3.fromHSV(0.33 * frac, 0.75, 0.9)
+		hudText.Text = string.format("%s  •  %d st", name, math.floor(dist))
+		markerLabel.Text = name
+		setAvatar(userId)
+	else
+		targetText.Text = settings.circleEnabled and "Dairede kimse yok" or "Hedef yok"
+		hpText.Text = ""
+		hpFill.Size = UDim2.new(0, 0, 1, 0)
+		hudText.Text = settings.circleEnabled and "Dairede kimse yok" or "Hedef yok"
+		setAvatar(nil)
+	end
+end
+
+local function setCircleLocked(v)
+	if circleLocked ~= v then
+		circleLocked = v
+		renderCircle()
+		if v and running then
+			-- kilitlenince kısa vurgu efekti
+			circleStroke.Thickness = settings.circleThickness + 3
+			tween(circleStroke, { Thickness = settings.circleThickness }, 0.3)
+		end
+		hudStroke.Color = v and THEME.green or THEME.subtext
+		hudDot.BackgroundColor3 = v and THEME.green or THEME.subtext
+	end
+end
+
+------------------------------------------------------------
+-- DÖNDÜRME MANTIĞI
+------------------------------------------------------------
+local function approach(cur, goal, dt)
+	local d = (goal - cur + math.pi) % (2 * math.pi) - math.pi
+	if settings.speed >= 50 then
+		return cur + d
+	end
+	if settings.smoothing == "Lineer" then
+		local maxStep = math.rad(settings.speed * 20) * dt
+		return cur + math.clamp(d, -maxStep, maxStep)
+	end
+	return cur + d * (1 - math.exp(-settings.speed * dt))
+end
+
+local BIND_NAME = "YakinOyuncuyaBak"
+local camActive = false
+local camYaw, camPitch = 0, 0
+local savedFOV = nil
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function enterCamera()
+	if camActive then return end
+	camActive = true
+	local look = camera.CFrame.LookVector
+	camYaw = math.atan2(-look.X, -look.Z)
+	camPitch = math.asin(math.clamp(look.Y, -1, 1))
+	camera.CameraType = Enum.CameraType.Scriptable
+	UserInputService:GetMouseDelta()
+end
+
+local function exitCamera()
+	if not camActive then return end
+	camActive = false
+	camera.CameraType = Enum.CameraType.Custom
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+end
+
+local function mouseOverMenu()
+	if not main.Visible then return false end
+	local m = UserInputService:GetMouseLocation()
+	local p, s = main.AbsolutePosition, main.AbsoluteSize
+	return m.X >= p.X and m.X <= p.X + s.X and m.Y >= p.Y and m.Y <= p.Y + s.Y
+end
+
+-- Dokunmatik: ekrana sürükleyerek kamerayı çevir (kamera modunda)
+UserInputService.InputChanged:Connect(function(input, processed)
+	if processed or not camActive then return end
+	if input.UserInputType ~= Enum.UserInputType.Touch then return end
+	if main.Visible then
+		local p, a, s = input.Position, main.AbsolutePosition, main.AbsoluteSize
+		if p.X >= a.X and p.X <= a.X + s.X and p.Y >= a.Y and p.Y <= a.Y + s.Y then
+			return
+		end
+	end
+	local sens = 0.004 * settings.sensitivity
+	camYaw -= input.Delta.X * sens
+	camPitch -= input.Delta.Y * sens
+end)
+
+-- Fare tekerleği ile yakınlaştırma (kamera script'li olduğu için kendimiz yapıyoruz)
+UserInputService.InputChanged:Connect(function(input, processed)
+	if processed or not camActive or not settings.wheelZoom then return end
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		controls.cameraDistance.set(settings.cameraDistance - input.Position.Z * 2)
+	end
+end)
+
+local function hideMarker()
+	marker.Visible = false
+end
+
+local function step(dt)
+	camera = workspace.CurrentCamera
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then
+		currentTarget = nil
+		setTargetInfo(nil)
+		setCircleLocked(false)
+		hideMarker()
+		exitCamera()
+		return
+	end
+
+	-- FOV
+	if savedFOV then
+		local goalFov = settings.changeFOV and settings.fov or savedFOV
+		camera.FieldOfView += (goalFov - camera.FieldOfView) * math.min(1, dt * 10)
+	end
+
+	local head = char:FindFirstChild("Head") or hrp
+	local origin = head.Position
+	local target, info = findTarget(origin, camera.CFrame.LookVector, char)
+	currentTarget = target
+	setCircleLocked(target ~= nil)
+	local aimPos
+	if target then
+		setTargetInfo(target.DisplayName, info.dist, info.hum.Health, info.hum.MaxHealth, target.UserId)
+		aimPos = info.part.Position + Vector3.new(0, settings.heightOffset, 0)
+	else
+		setTargetInfo(nil)
+	end
+
+	-- Hedef işareti
+	if aimPos and settings.showMarker then
+		local sp = camera:WorldToViewportPoint(aimPos)
+		if sp.Z > 0 then
+			marker.Position = UDim2.fromOffset(sp.X, sp.Y)
+			markerStroke.Color = THEME.green
+			marker.Visible = true
+		else
+			marker.Visible = false
+		end
+	else
+		marker.Visible = false
+	end
+
+	-- KARAKTER MODU
+	if settings.mode == "Karakter" then
+		exitCamera()
+		if not aimPos then
+			if hum.AutoRotate == false then hum.AutoRotate = true end
+			return
+		end
+		hum.AutoRotate = false
+		local pos = hrp.Position
+		local dir = aimPos - pos
+		if Vector3.new(dir.X, 0, dir.Z).Magnitude > 0.05 then
+			local look = hrp.CFrame.LookVector
+			local curYaw = math.atan2(-look.X, -look.Z)
+			local goalYaw = math.atan2(-dir.X, -dir.Z)
+			hrp.CFrame = CFrame.new(pos) * CFrame.Angles(0, approach(curYaw, goalYaw, dt), 0)
+		end
+		return
+	end
+
+	-- KAMERA MODU
+	if hum.AutoRotate == false then hum.AutoRotate = true end
+	enterCamera()
+	if camera.CameraType ~= Enum.CameraType.Scriptable then
+		camera.CameraType = Enum.CameraType.Scriptable
+	end
+
+	-- Fare: daire açıkken ekran ortasında kilitli (serbest bakış). Alt = geçici serbest bırak.
+	local rmb = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+	local altHeld = UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt)
+	local autoLock = settings.circleEnabled and settings.circleMouseLock
+		and not altHeld and not mouseOverMenu()
+	local freeLook = (settings.lockMouse and not altHeld) or autoLock
+
+	if freeLook then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	elseif rmb then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+	else
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+
+	local delta = UserInputService:GetMouseDelta()
+	local limit = math.rad(settings.pitchLimit)
+	if freeLook or rmb then
+		local sens = 0.003 * settings.sensitivity
+		camYaw -= delta.X * sens
+		camPitch -= delta.Y * sens
+	end
+
+	-- Hedef sadece dairenin içindeyken (daire kapalıysa her zaman) kamerayı çeker
+	if aimPos then
+		local dir = aimPos - origin
+		if dir.Magnitude > 0.05 then
+			camYaw = approach(camYaw, math.atan2(-dir.X, -dir.Z), dt)
+			if not settings.cameraYawOnly then
+				camPitch = approach(camPitch, math.asin(math.clamp(dir.Unit.Y, -1, 1)), dt)
+			end
+		end
+	end
+	camPitch = math.clamp(camPitch, -limit, limit)
+
+	local rot = CFrame.Angles(0, camYaw, 0) * CFrame.Angles(camPitch, 0, 0)
+	local pos = origin
+	if settings.cameraDistance > 0.5 then
+		local back = -rot.LookVector * settings.cameraDistance
+		rayParams.FilterDescendantsInstances = { char }
+		local hit = workspace:Raycast(origin, back, rayParams)
+		if hit then
+			pos = hit.Position + rot.LookVector * 0.5
+		else
+			pos = origin + back
+		end
+	end
+	camera.CFrame = CFrame.new(pos) * rot
+end
+
+------------------------------------------------------------
+-- BAŞLAT / DURDUR
+------------------------------------------------------------
+setRunning = function(state)
+	if state == running then return end
+	running = state
+	if running then
+		savedFOV = camera.FieldOfView
+		runBtn.Text = "■  DURDUR"
+		tween(runBtn, { BackgroundColor3 = THEME.red })
+		mobileRunBtn.Text = "DURDUR"
+		tween(mobileRunBtn, { BackgroundColor3 = THEME.red })
+		statusText.Text = "Durum: Çalışıyor"
+		statusText.TextColor3 = THEME.green
+		pillText.Text = "AKTİF"
+		pillText.TextColor3 = THEME.green
+		tween(pill, { BackgroundColor3 = Color3.fromRGB(28, 70, 50) })
+		statusDot.BackgroundColor3 = THEME.green
+		dotStroke.Transparency = 0.2
+		pulseTween = TweenService:Create(
+			dotStroke,
+			TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{ Transparency = 1 }
+		)
+		pulseTween:Play()
+		RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, step)
+		if settings.silentUI and main.Visible then
+			setMenuVisible(false)
+			hiddenBySilent = true
+		end
+		notify("Başlatıldı")
+	else
+		pcall(function()
+			RunService:UnbindFromRenderStep(BIND_NAME)
+		end)
+		exitCamera()
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.AutoRotate = true end
+		if savedFOV then
+			camera.FieldOfView = savedFOV
+			savedFOV = nil
+		end
+		currentTarget = nil
+		setTargetInfo(nil)
+		hideMarker()
+		runBtn.Text = "▶  ÇALIŞTIR"
+		tween(runBtn, { BackgroundColor3 = THEME.green })
+		mobileRunBtn.Text = "BAŞLAT"
+		tween(mobileRunBtn, { BackgroundColor3 = THEME.green })
+		statusText.Text = "Durum: Kapalı"
+		statusText.TextColor3 = THEME.subtext
+		pillText.Text = "KAPALI"
+		pillText.TextColor3 = THEME.subtext
+		tween(pill, { BackgroundColor3 = THEME.off })
+		statusDot.BackgroundColor3 = THEME.subtext
+		if pulseTween then
+			pulseTween:Cancel()
+			pulseTween = nil
+		end
+		dotStroke.Transparency = 1
+		if hiddenBySilent then
+			setMenuVisible(true)
+			hiddenBySilent = false
+		end
+		notify("Durduruldu")
+	end
+	circleLocked = false
+	renderCircle()
+	refreshDot()
+end
+
+runBtn.MouseButton1Click:Connect(function()
+	setRunning(not running)
+end)
+
+------------------------------------------------------------
+-- KLAVYE
+------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if listener and input.UserInputType == Enum.UserInputType.Keyboard then
+		local l = listener
+		listener = nil
+		l(input.KeyCode)
+		return
+	end
+	if processed then return end
+	if input.KeyCode == settings.keyMenu then
+		setMenuVisible(not main.Visible)
+		hiddenBySilent = false
+	elseif input.KeyCode == settings.keyCircle then
+		controls.circleEnabled.set(not settings.circleEnabled)
+		notify(settings.circleEnabled and "Daire: Açık" or "Daire: Kapalı")
+	elseif input.KeyCode == settings.keyToggle then
+		if settings.holdMode then
+			setRunning(true)
+		else
+			setRunning(not running)
+		end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if settings.holdMode and input.KeyCode == settings.keyToggle then
+		setRunning(false)
+	end
+end)
+
+gui.Destroying:Connect(function()
+	setRunning(false)
+end)
